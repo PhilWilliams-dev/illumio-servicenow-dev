@@ -1,0 +1,224 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_script_include">
+    <sys_script_include action="INSERT_OR_UPDATE">
+        <access>package_private</access>
+        <active>true</active>
+        <api_name>x_illu2_illumio.IllumioSaaSHttpClient</api_name>
+        <caller_access/>
+        <client_callable>false</client_callable>
+        <description/>
+        <name>IllumioSaaSHttpClient</name>
+        <script><![CDATA[ms.include('IllumioSaaSHttpIncludes');
+
+
+var IllumioSaaSHTTPClient = Class.create();
+IllumioSaaSHTTPClient.prototype = {
+    initialize: function(baseUrl, username, password, retryParams) {
+        this.logger = new IllumioSaaSLogUtil();
+        this.baseUrl = baseUrl;
+        this.client = this._setupClient(baseUrl, username, password);
+        this.httpRetryCount = retryParams.http_retry_count;
+        this.httpRetryIntervalIncrement = retryParams.http_retry_interval_increment;
+        this.httpRetryIntervalMax = retryParams.http_retry_interval_max;
+    },
+
+	/**
+     * Setup the HTTP client
+     * @param {string} baseUrl Base URL of the REST API
+     * @param {string} username Username for the REST API
+     * @param {string} password Password for the REST API
+     * @returns {RESTMessageV2} HTTP client
+     **/
+    _setupRestClient: function(baseUrl, username, password) {
+        var client = new sn_ws.RESTMessageV2();
+        client.setEndpoint(baseUrl);
+		client.setBasicAuth(username, password);
+        
+        return client;
+	},
+
+  
+
+    /**
+     * Execute the HTTP request
+     * @param {String} endpoint Endpoint of the API
+     * @param {String} queryString Query to add in the URL
+     * @param {String} methodName Name of the method
+     * @param {JSON} headers Object of headers to add to the request
+     * @param {JSON} requestData Request body as JSON
+     * @returns {JSON} Object of the response
+     */
+    _executeMethod: function(endpoint, queryString, method, headers, requestData, retryCount, lastSleepTime) {
+
+        this.logger._debug('APICALL: ' + method.getName() + ' endpoint: ' + endpoint + ' queryString: ' + queryString);
+        if (queryString != '') {
+            method.setQueryString(queryString);
+        }
+
+        if (headers) {
+            for (var header in headers) {
+                method.addRequestHeader(header, headers[header]);
+            }
+        }
+        if (requestData) {
+            method.setRequestBody(JSON.stringify(requestData));
+            method.addRequestHeader('Content-Type', 'application/json');
+        }
+        try {
+            this.client.executeMethod(method);
+            var responseBody = method.getResponseBodyAsString();
+            var responseCode = parseInt(method.getStatusCode());
+            var getMethodResponseHeaders = method.getResponseHeaders();
+            var responseHeaders = {};
+            for (var i = 0, len = getMethodResponseHeaders.length; i < len; i++) {
+                responseHeaders[getMethodResponseHeaders[i].getName()] = getMethodResponseHeaders[i].getValue();
+            }
+
+            // if response status is 200 ok or 202 for async request
+            if (responseCode >= 200 && responseCode < 300) {
+                var responseObj = {
+                    hasError: false,
+                    data: new JSON().decode(responseBody),
+                    headers: responseHeaders,
+                    status: responseCode
+                };
+                this.logger._debug('HTTP ' + method.getName() + ' Call complete, status: ' + responseCode);
+                return responseObj;
+            }
+
+            retryCount = (typeof retryCount == 'undefined') ? this.httpRetryCount : retryCount;
+            if (retryCount <= 0 || (RETRY_CODES.indexOf(responseCode) == -1 && !(responseCode >= 500))) {
+                this.logger._error('Failed: HTTP' + method.getName() + ' Call, status: ' + responseCode);
+                return {
+                    hasError: true,
+                    status: responseCode
+                };
+            }
+
+            lastSleepTime = lastSleepTime ? lastSleepTime : 0;
+            lastSleepTime = Math.min(this.httpRetryIntervalMax, lastSleepTime + this.httpRetryIntervalIncrement);
+            if (responseCode == 429) {
+				var retryAfterHeader = responseHeaders['retry-after'];
+                if (retryAfterHeader) {
+                    lastSleepTime = this.parseRetryAfterHeader(retryAfterHeader) || lastSleepTime;
+                }
+            }
+            this.logger._error('Failed to execute HTTP call: Waiting for ' + lastSleepTime + ' seconds before doing another REST call.');
+            Packages.java.lang.Thread.sleep(lastSleepTime * 1000);
+            return this._executeMethod(endpoint, queryString, method, headers, requestData, retryCount - 1, lastSleepTime);
+        } catch (e) {
+            this.logger._error('PCE request failed : Exception ' + e);
+            this.logger._error('Failed: HTTP' + method.getName() + ' Call, status: 0');
+            return {
+                hasError: true,
+                status: 0
+            };
+        }
+    },
+
+    /**
+     * Execute the GET call and retry multiple times if the request fails
+     * @param {String} endpoint Endpoint of the API
+     * @param {String} queryString Query to add in the URL
+     * @param {JSON} headers Object of headers to add to the request
+     * @param {JSON} requestData Request body as JSON
+     * @returns {JSON} Object of the response
+     **/
+    get: function(endpoint, queryString, headers, requestData) {
+        var getMethod = new GetMethod(this.baseUrl + endpoint);
+        return this._executeMethod(endpoint, queryString, getMethod, headers, requestData);
+    },
+
+    /**
+     * Execute the POST call and retry multiple times if the request fails
+     * @param {String} endpoint Endpoint of the API
+     * @param {String} queryString Query to add in the URL
+     * @param {JSON} headers Object of headers to add to the request
+     * @param {JSON} requestData Request body as JSON
+     * @returns {JSON} Object of the response
+     **/
+    post: function(endpoint, queryString, headers, requestData) {
+        var postMethod = new PostMethod(this.baseUrl + endpoint);
+        return this._executeMethod(endpoint, queryString, postMethod, headers, requestData);
+    },
+
+    /**
+     * Execute the PUT call and retry multiple times if the request fails
+     * @param {String} endpoint Endpoint of the API
+     * @param {String} queryString Query to add in the URL
+     * @param {JSON} headers Object of headers to add to the request
+     * @param {JSON} requestData Request body as JSON
+     * @returns {JSON} Object of the response
+     **/
+    put: function(endpoint, queryString, headers, requestData) {
+        var putMethod = new PutMethod(this.baseUrl + endpoint);
+        return this._executeMethod(endpoint, queryString, putMethod, headers, requestData);
+    },
+
+    /**
+     * Execute the DELETE call and retry multiple times if the request fails
+     * @param {String} endpoint Endpoint of the API
+     * @param {String} queryString Query to add in the URL
+     * @param {JSON} headers Object of headers to add to the request
+     * @param {JSON} requestData Request body as JSON
+     * @returns {JSON} Object of the response
+     **/
+    deleteMethod: function(endpoint, queryString, headers, requestData) {
+        var method = new DeleteMethod(this.baseUrl + endpoint);
+        return this._executeMethod(endpoint, queryString, method, headers, requestData);
+    },
+
+    /**
+     * Get the value of the parameter from the config file
+     * @param {string} parm parameters to get from config.xml
+     * @returns Value of the parameter
+     */
+    getMidConfigParam: function(parm) {
+
+        try {
+            var m = Packages.com.service_now.mid.MIDServer.get();
+            var config = m.getConfig();
+            var result = config.getParameter(parm);
+            var result_alternative = config.getProperty(parm);
+
+            if (result) {
+                return result;
+            } else if (result_alternative) {
+                return result_alternative;
+            } else {
+                config = Packages.com.service_now.mid.services.Config.get();
+                result = config.getProperty(parm);
+                return result;
+            }
+        } catch (error) {
+            this.logger._except('Failed to load mid server configurations.');
+            return null;
+        }
+    },
+
+    parseRetryAfterHeader: function(retryAfter) {
+        var retryAfterSeconds = parseInt(retryAfter);
+        if (isNaN(retryAfterSeconds)) {
+            var retryAfterDate = new Date(retryAfter);
+            if (retryAfterDate) {
+                retryAfterSeconds = Math.floor((retryAfterDate.getTime() - new Date().getTime())/1000);
+            }
+        }
+        return retryAfterSeconds || 0;
+    },
+
+    type: 'IllumioSaaSHTTPClient'
+};]]></script>
+        <sys_class_name>sys_script_include</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-03-25 09:50:09</sys_created_on>
+        <sys_id>ea090a5747054210490ae481e36d43c1</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>IllumioSaaSHttpClient</sys_name>
+        <sys_package display_value="Illumio" source="x_illu2_illumio">15314f1ddb882700dc9fabc5ca961943</sys_package>
+        <sys_policy>read</sys_policy>
+        <sys_scope display_value="Illumio">15314f1ddb882700dc9fabc5ca961943</sys_scope>
+        <sys_update_name>sys_script_include_ea090a5747054210490ae481e36d43c1</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-03-25 09:50:09</sys_updated_on>
+    </sys_script_include>
+</record_update>
